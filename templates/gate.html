@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Accès protégé</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="card">
+    <h1>Accès protégé</h1>
+    <p class="hint">Cette app est exposée sur internet. Entre le mot de passe d'accès.</p>
+
+    {% if error %}
+      <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <form method="post">
+      <label>Mot de passe</label>
+      <input type="password" name="password" required autofocus>
+      <button type="submit">Entrer</button>
+    </form>
+  </div>
+</body>
+</html>
