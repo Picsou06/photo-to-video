@@ -1,45 +1,51 @@
 # Photos → Vidéo
 
-Petite app web : tu envoies plusieurs photos, tu choisis un nombre
-d'images par seconde, elle génère une vidéo (ffmpeg) et te la fait
-télécharger.
+Petite app web : tu envoies plusieurs photos, tu règles le diaporama, elle génère une vidéo H.264 (ffmpeg) à regarder et télécharger.
 
-## Fonctionnement
+## Fonctionnalités
 
-- Les photos sont normalisées (rotation EXIF corrigée, redimensionnées si
-  besoin, mises à la taille de la première photo avec des bandes noires si
-  le ratio ne correspond pas) puis assemblées en vidéo H.264 au frame rate
-  choisi.
-- Le fichier vidéo généré est supprimé du serveur juste après l'envoi au
-  navigateur — rien ne s'accumule sur le disque.
-- Nécessite `ffmpeg` installé sur le système (pas une lib Python).
+- Ajout de photos en plusieurs fois, par bouton ou glisser-déposer.
+- Ordre modifiable : glisser une vignette (appui long sur téléphone), flèches, tri par nom ou par date, inversion.
+- Suppression d'une photo ou de toutes.
+- Réglages :
+  - durée de chaque photo (0,1 à 10 s) ;
+  - transition : aucune, fondu ou glissement, et sa durée ;
+  - format : celui de la première photo, 16:9, 9:16, 1:1 ou 4:3 ;
+  - photos d'un autre format : bandes (couleur au choix) ou recadrage ;
+  - résolution 480p, 720p ou 1080p, et qualité.
+- Aperçu du diaporama dans le navigateur avant la génération.
+- Vidéo lisible directement dans la page, puis téléchargeable.
+- Affichage adapté à l'ordinateur et au téléphone.
+- Les fichiers sont supprimés du serveur dès que la vidéo a été téléchargée.
 
-## Installation
+## Lancement avec Docker
 
 ```bash
-cd photo-to-video
+cp .env.example .env   # remplir FLASK_SECRET, et APP_PASSWORD si l'app n'est pas protégée autrement
+docker compose up -d --build
+```
+
+L'app écoute sur `127.0.0.1:5011`, à placer derrière un reverse proxy en HTTPS.
+
+## Lancement sans Docker
+
+Nécessite Python 3 et `ffmpeg` installé sur le système.
+
+```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-```
-
-## Lancement
-
-```bash
 python app.py
 ```
 
-Ouvre l'URL affichée, choisis tes photos (dans l'ordre où tu veux
-qu'elles apparaissent), règle les images/seconde, et télécharge la vidéo.
+## Réglages du serveur
 
-## Réglages
-
-Variables d'environnement (dans `.env` ou en ligne de commande) :
+Variables d'environnement (dans `.env`) :
 
 - `HOST` (défaut `0.0.0.0`), `PORT` (défaut `5001`)
-- `DISABLE_SSL` — `1` pour servir en HTTP simple (usage local uniquement)
-- `APP_PASSWORD` — mot de passe d'accès si l'app est exposée publiquement
-- `CERT_DOMAIN` — domaine dont le certificat certbot sera utilisé pour le HTTPS
-- `MAX_UPLOAD_MB` — taille max d'upload en Mo (défaut : 500)
-- `MAX_DIMENSION` — plus grande dimension autorisée par photo en pixels,
-  au-delà l'image est réduite (défaut : 1920)
+- `DISABLE_SSL` : `1` pour servir en HTTP simple (derrière un reverse proxy, ou en local)
+- `APP_PASSWORD` : mot de passe demandé par l'app avant d'y accéder
+- `FLASK_SECRET` : clé de signature des sessions
+- `CERT_DOMAIN` : domaine dont le certificat certbot sera utilisé pour le HTTPS intégré
+- `MAX_UPLOAD_MB` : taille maximale d'un envoi en Mo (défaut : illimité)
+- `MAX_DIMENSION` : plus grand côté de la vidéo en pixels (défaut : 1920)

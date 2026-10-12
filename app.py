@@ -1,4 +1,5 @@
 import hmac
+import math
 import os
 import shutil
 import subprocess
@@ -34,11 +35,17 @@ CERT_DOMAIN = os.environ.get("CERT_DOMAIN")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "5001"))
 DISABLE_SSL = os.environ.get("DISABLE_SSL", "").lower() in ("1", "true", "yes")
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "0"))  # 0 = illimité
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "0"))
 MAX_DIMENSION = int(os.environ.get("MAX_DIMENSION", "1920"))
 
 FAILED_ATTEMPT_LIMIT = 10
 FAILED_ATTEMPT_LOCKOUT_SECONDS = 5 * 60
+
+OUTPUT_FPS = 30
+TRANSITIONS = ("none", "fade", "slide")
+ASPECTS = {"auto": None, "16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "3:4": (3, 4)}
+RESOLUTIONS = (480, 720, 1080)
+FITS = ("contain", "cover")
 
 
 def _get_ssl_context():
@@ -70,8 +77,8 @@ app = Flask(__name__)
 app.secret_key = _get_secret_key()
 app.config["MAX_CONTENT_LENGTH"] = (MAX_UPLOAD_MB * 1024 * 1024) if MAX_UPLOAD_MB > 0 else None
 
-_failed_attempts = {}  # ip -> (count, first_attempt_ts)
-_jobs = {}  # job_id -> {"status": ..., "current": int, "total": int, "error": str|None}
+_failed_attempts = {}
+_jobs = {}
 _jobs_lock = threading.Lock()
 
 
@@ -145,60 +152,125 @@ def index():
     return render_template("index.html", max_upload_mb=MAX_UPLOAD_MB)
 
 
-def _normalize_frame(raw_path, target_size):
+def _even(x):
+    return max(2, int(round(x / 2)) * 2)
+
+
+def _oriented_size(raw_path):
     with Image.open(raw_path) as img:
-        img = ImageOps.exif_transpose(img)
-        img = img.convert("RGB")
-
-        if img.width > MAX_DIMENSION or img.height > MAX_DIMENSION:
-            img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
-
-        if target_size is None:
-            target_size = img.size
-
-        return ImageOps.pad(img, target_size, color=(0, 0, 0)), target_size
+        w, h = img.size
+        if img.getexif().get(0x0112) in (5, 6, 7, 8):
+            w, h = h, w
+        return w, h
 
 
-def _process_job(job_id, work_dir, raw_paths, fps, output_path):
+def _video_size(first_size, aspect, short_side):
+    w, h = aspect or first_size
+    if w >= h:
+        width, height = short_side * w / h, short_side
+    else:
+        width, height = short_side, short_side * h / w
+    scale = min(1.0, MAX_DIMENSION / max(width, height))
+    return _even(width * scale), _even(height * scale)
+
+
+def _normalize_frame(raw_path, size, fit, background):
+    with Image.open(raw_path) as img:
+        img.draft("RGB", (max(size) * 2, max(size) * 2))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        if fit == "cover":
+            return ImageOps.fit(img, size, Image.LANCZOS)
+        return ImageOps.pad(img, size, Image.LANCZOS, color=background)
+
+
+def _transition_frames(a, b, style, count):
+    width = a.width
+    for k in range(1, count + 1):
+        t = k / (count + 1)
+        if style == "fade":
+            yield Image.blend(a, b, t)
+        else:
+            t = 0.5 - 0.5 * math.cos(t * math.pi)
+            shift = round(width * t)
+            frame = Image.new("RGB", a.size)
+            frame.paste(a, (-shift, 0))
+            frame.paste(b, (width - shift, 0))
+            yield frame
+
+
+def _process_job(job_id, work_dir, raw_paths, opts, output_path):
     n = len(raw_paths)
-    total_steps = n * 2  # normalizing (0..n) + encoding (n..2n)
+    duration, transition, tr_duration = opts["duration"], opts["transition"], opts["transition_duration"]
+    tr_count = round(tr_duration * OUTPUT_FPS) if transition != "none" and n > 1 else 0
+    total_steps = n + (n - 1) * tr_count + 100
+    step = 0
     try:
-        target_size = None
+        try:
+            first_size = _oriented_size(raw_paths[0])
+        except Exception as e:
+            _set_job(job_id, status="error", error=f"Image invalide ({raw_paths[0].name}) : {e}")
+            return
+        size = _video_size(first_size, ASPECTS[opts["aspect"]], opts["resolution"])
+
+        playlist = []
+        previous = None
         for i, raw_path in enumerate(raw_paths):
-            _set_job(job_id, status="normalizing", current=i, total=total_steps)
+            _set_job(job_id, status="normalizing", current=step, total=total_steps)
             try:
-                frame, target_size = _normalize_frame(raw_path, target_size)
+                frame = _normalize_frame(raw_path, size, opts["fit"], opts["background"])
             except Exception as e:
-                _set_job(job_id, status="error", error=f"Image invalide ({raw_path.name}) : {e}")
+                _set_job(job_id, status="error", error=f"Image invalide (photo n° {i + 1}) : {e}")
                 return
-            frame.save(work_dir / f"frame_{i:05d}.jpg", quality=92)
             raw_path.unlink(missing_ok=True)
+            step += 1
 
-        _set_job(job_id, status="encoding", current=n, total=total_steps)
+            if previous is not None and tr_count:
+                _set_job(job_id, status="transitions", current=step, total=total_steps)
+                for k, tr_frame in enumerate(_transition_frames(previous, frame, transition, tr_count)):
+                    name = f"tr_{i:05d}_{k:03d}.jpg"
+                    tr_frame.save(work_dir / name, quality=90)
+                    playlist.append((name, 1 / OUTPUT_FPS))
+                    step += 1
+                    if k % 10 == 0:
+                        _set_job(job_id, current=step)
 
+            name = f"frame_{i:05d}.jpg"
+            frame.save(work_dir / name, quality=92)
+            playlist.append((name, duration))
+            previous = frame
+
+        total_seconds = sum(d for _, d in playlist)
+        lines = []
+        for name, d in playlist:
+            lines += [f"file '{name}'", f"duration {d:.6f}"]
+        lines.append(f"file '{playlist[-1][0]}'")
+        (work_dir / "playlist.txt").write_text("\n".join(lines) + "\n")
+
+        _set_job(job_id, status="encoding", current=step, total=total_steps)
         cmd = [
             "ffmpeg", "-y",
-            "-framerate", str(fps),
-            "-i", str(work_dir / "frame_%05d.jpg"),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-f", "concat", "-safe", "0", "-i", str(work_dir / "playlist.txt"),
+            "-vf", f"fps={OUTPUT_FPS},format=yuv420p",
+            "-t", f"{total_seconds:.3f}",
+            "-c:v", "libx264", "-preset", "medium", "-crf", str(opts["crf"]),
+            *(["-tune", "stillimage"] if not tr_count else []),
+            "-movflags", "+faststart",
             "-progress", "pipe:1",
             "-nostats",
             str(output_path),
         ]
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
         for line in proc.stdout:
             line = line.strip()
-            if line.startswith("frame="):
+            if line.startswith("out_time_us="):
                 try:
-                    frame_num = min(int(line.split("=", 1)[1]), n)
-                    _set_job(job_id, status="encoding", current=n + frame_num, total=total_steps)
+                    pct = min(100, int(int(line.split("=", 1)[1]) / 1e6 / total_seconds * 100))
+                    _set_job(job_id, status="encoding", current=step + max(pct, 0), total=total_steps)
                 except ValueError:
                     pass
-        proc.wait(timeout=900)
+        proc.wait(timeout=1800)
         stderr_output = proc.stderr.read()
 
         if proc.returncode != 0:
@@ -212,6 +284,53 @@ def _process_job(job_id, work_dir, raw_paths, fps, output_path):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _form_float(name, default, low, high):
+    try:
+        value = float(request.form.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
+def _video_options():
+    duration = _form_float("duration", 0, 0, 10)
+    if not duration:
+        duration = 1 / _form_float("fps", 1, 0.1, 10)
+    duration = max(0.1, duration)
+    transition = request.form.get("transition", "none")
+    if transition not in TRANSITIONS:
+        transition = "none"
+    aspect = request.form.get("aspect", "auto")
+    if aspect not in ASPECTS:
+        aspect = "auto"
+    try:
+        resolution = int(request.form.get("resolution", 1080))
+    except ValueError:
+        resolution = 1080
+    if resolution not in RESOLUTIONS:
+        resolution = 1080
+    fit = request.form.get("fit", "contain")
+    if fit not in FITS:
+        fit = "contain"
+    background = request.form.get("background", "#000000")
+    try:
+        if len(background) != 7 or background[0] != "#":
+            raise ValueError
+        rgb = tuple(int(background[i:i + 2], 16) for i in (1, 3, 5))
+    except ValueError:
+        rgb = (0, 0, 0)
+    return {
+        "duration": duration,
+        "transition": transition,
+        "transition_duration": _form_float("transition_duration", 0.5, 0.1, 2),
+        "aspect": aspect,
+        "resolution": resolution,
+        "fit": fit,
+        "background": rgb,
+        "crf": int(_form_float("crf", 23, 18, 32)),
+    }
+
+
 @app.route("/api/generate", methods=["POST"])
 def generate():
     files = request.files.getlist("images")
@@ -219,11 +338,7 @@ def generate():
     if not files:
         return jsonify({"error": "Aucune image reçue."}), 400
 
-    try:
-        fps = float(request.form.get("fps", "1"))
-    except ValueError:
-        fps = 1.0
-    fps = max(0.1, min(fps, 60))
+    opts = _video_options()
 
     job_id = uuid.uuid4().hex[:12]
     work_dir = Path(tempfile.mkdtemp(prefix=f"ptv_{job_id}_"))
@@ -240,13 +355,13 @@ def generate():
         _jobs[job_id] = {
             "status": "normalizing",
             "current": 0,
-            "total": len(raw_paths) * 2,
+            "total": len(raw_paths) + 100,
             "error": None,
         }
 
     threading.Thread(
         target=_process_job,
-        args=(job_id, work_dir, raw_paths, fps, output_path),
+        args=(job_id, work_dir, raw_paths, opts, output_path),
         daemon=True,
     ).start()
 

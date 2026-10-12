@@ -1,0 +1,19 @@
+services:
+  photo-to-video:
+    build: .
+    image: photo-to-video:local
+    container_name: photo-to-video
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: UTC
+    ports:
+      - "127.0.0.1:5011:5001"
+    cpus: 2
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5001/gate', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

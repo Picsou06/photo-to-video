@@ -4,7 +4,6 @@ __pycache__/
 .env
 .flask_secret
 outputs/
-# --- sauvegarde-vps ---
 .env
 .env.*
 !.env.example
@@ -33,6 +32,5 @@ sessions/
 *.dump
 *.apk
 .flask_secret
-.claude/settings.local.json
 a.out
 outputs/
